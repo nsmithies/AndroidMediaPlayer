@@ -1,0 +1,28 @@
+# Gradle
+.gradle/
+build/
+**/build/
+
+# Android Studio
+.idea/
+*.iml
+
+# Local machine configuration
+local.properties
+**/local.properties
+
+# Signing / credentials
+*.jks
+*.keystore
+.env
+.env.*
+
+# Native build
+.externalNativeBuild/
+.cxx/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
