@@ -43,6 +43,9 @@ import kotlinx.coroutines.withContext
 import com.google.common.util.concurrent.MoreExecutors
 
 private enum class LibraryTab { ALBUMS, ARTISTS, SONGS, PLAYLISTS }
+private enum class SearchField(val label: String) {
+    ALL("All"), ARTIST("Artist"), ALBUM("Album"), SONG("Song"), GENRE("Genre"), YEAR("Year")
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -274,6 +277,18 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                fun clearNowPlaying() {
+                    controller?.stop()
+                    controller?.clearMediaItems()
+                    playbackQueue = emptyList()
+                    nowPlaying = null
+                    isPlaying = false
+                    isBuffering = false
+                    playbackPositionMs = 0L
+                    playbackDurationMs = 0L
+                    playbackError = null
+                }
+
                 var server by remember { mutableStateOf<DlnaServer?>(null) }
                 var serverConnected by remember { mutableStateOf(false) }
                 var reconnecting by remember { mutableStateOf(false) }
@@ -449,6 +464,7 @@ class MainActivity : ComponentActivity() {
                             onSeek = { seekTo(it) },
                             onJumpToQueueIndex = { jumpToQueueIndex(it) },
                             onRemoveQueueIndex = { removeQueueIndex(it) },
+                            onClearNowPlaying = { clearNowPlaying() },
                             selectedAlbum = selectedAlbum,
                             albumTracks = albumTracks,
                             onSelectAlbum = { album ->
@@ -547,6 +563,7 @@ private fun LibraryHome(
     onSeek: (Long) -> Unit,
     onJumpToQueueIndex: (Int) -> Unit,
     onRemoveQueueIndex: (Int) -> Unit,
+    onClearNowPlaying: () -> Unit,
     selectedAlbum: MusicAlbum?,
     albumTracks: List<MusicTrack>,
     onSelectAlbum: (MusicAlbum) -> Unit,
@@ -564,9 +581,27 @@ private fun LibraryHome(
     var nowPlayingOpen by remember { mutableStateOf(false) }
     var queueOpen by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
+    var searchField by remember { mutableStateOf(SearchField.ALL) }
+    var aboutOpen by remember { mutableStateOf(false) }
+    var selectedPlaylist by remember { mutableStateOf<MusicPlaylist?>(null) }
+    var playlists by remember { mutableStateOf<List<MusicPlaylist>>(emptyList()) }
+    var playlistTracks by remember { mutableStateOf<List<MusicTrack>>(emptyList()) }
     var selectedArtist by remember { mutableStateOf<MusicArtist?>(null) }
     var randomTracks by remember { mutableStateOf<List<MusicTrack>>(emptyList()) }
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(tab, createPlaylistOpen) {
+        if (tab == LibraryTab.PLAYLISTS && !createPlaylistOpen) {
+            playlists = withContext(Dispatchers.IO) { database.getPlaylists() }
+        }
+    }
+
+    fun openPlaylist(playlist: MusicPlaylist) {
+        selectedPlaylist = playlist
+        scope.launch {
+            playlistTracks = withContext(Dispatchers.IO) { database.getPlaylistTracks(playlist.id) }
+        }
+    }
 
     if (selectedAlbum != null) {
         AlbumDetail(
@@ -575,6 +610,19 @@ private fun LibraryHome(
             database = database,
             onBack = onBackAlbum,
             onPlayTrack = { track -> onPlayQueue(albumTracks, track) },
+            onPlayNextItems = onPlayNextItems,
+            onAddToNowPlaying = onAddToNowPlaying
+        )
+        return
+    }
+
+    selectedPlaylist?.let { playlist ->
+        PlaylistDetail(
+            playlist = playlist,
+            tracks = playlistTracks,
+            database = database,
+            onBack = { selectedPlaylist = null; playlistTracks = emptyList() },
+            onPlayQueue = onPlayQueue,
             onPlayNextItems = onPlayNextItems,
             onAddToNowPlaying = onAddToNowPlaying
         )
@@ -604,7 +652,7 @@ private fun LibraryHome(
     }
 
     BackHandler(
-        enabled = searchOpen || randomOpen || settingsOpen || createPlaylistOpen || nowPlayingOpen || queueOpen || toolsOpen
+        enabled = searchOpen || randomOpen || settingsOpen || aboutOpen || createPlaylistOpen || nowPlayingOpen || queueOpen || toolsOpen
     ) {
         when {
             nowPlayingOpen -> nowPlayingOpen = false
@@ -612,6 +660,7 @@ private fun LibraryHome(
             searchOpen -> searchOpen = false
             randomOpen -> randomOpen = false
             settingsOpen -> settingsOpen = false
+            aboutOpen -> aboutOpen = false
             createPlaylistOpen -> createPlaylistOpen = false
             toolsOpen -> toolsOpen = false
         }
@@ -619,27 +668,33 @@ private fun LibraryHome(
 
 
     val normalizedQuery = query.trim().lowercase()
-    val matchingSongs = remember(normalizedQuery, tracks) {
+    val matchingSongs = remember(normalizedQuery, searchField, tracks) {
         if (normalizedQuery.isBlank()) emptyList() else tracks.asSequence().filter {
-            it.title.lowercase().contains(normalizedQuery) ||
-                it.artist.lowercase().contains(normalizedQuery) ||
-                it.album.lowercase().contains(normalizedQuery) ||
-                it.genre.lowercase().contains(normalizedQuery) ||
-                it.year.lowercase().contains(normalizedQuery)
+            when (searchField) {
+                SearchField.ALL -> it.title.lowercase().contains(normalizedQuery) || it.artist.lowercase().contains(normalizedQuery) || it.album.lowercase().contains(normalizedQuery) || it.genre.lowercase().contains(normalizedQuery) || it.year.lowercase().contains(normalizedQuery)
+                SearchField.SONG -> it.title.lowercase().contains(normalizedQuery)
+                SearchField.ARTIST -> it.artist.lowercase().contains(normalizedQuery)
+                SearchField.ALBUM -> it.album.lowercase().contains(normalizedQuery)
+                SearchField.GENRE -> it.genre.lowercase().contains(normalizedQuery)
+                SearchField.YEAR -> it.year.lowercase().contains(normalizedQuery)
+            }
         }.take(300).toList()
     }
-    val matchingAlbums = remember(normalizedQuery, albums) {
-        if (normalizedQuery.isBlank()) emptyList() else albums.filter {
-            it.title.lowercase().contains(normalizedQuery) ||
-                it.artist.lowercase().contains(normalizedQuery) ||
-                it.genre.lowercase().contains(normalizedQuery) ||
-                it.year.lowercase().contains(normalizedQuery)
+    val matchingAlbums = remember(normalizedQuery, searchField, albums) {
+        if (normalizedQuery.isBlank() || searchField == SearchField.SONG) emptyList() else albums.filter {
+            when (searchField) {
+                SearchField.ALL -> it.title.lowercase().contains(normalizedQuery) || it.artist.lowercase().contains(normalizedQuery) || it.genre.lowercase().contains(normalizedQuery) || it.year.lowercase().contains(normalizedQuery)
+                SearchField.ARTIST -> it.artist.lowercase().contains(normalizedQuery)
+                SearchField.ALBUM -> it.title.lowercase().contains(normalizedQuery)
+                SearchField.GENRE -> it.genre.lowercase().contains(normalizedQuery)
+                SearchField.YEAR -> it.year.lowercase().contains(normalizedQuery)
+                SearchField.SONG -> false
+            }
         }.take(100)
     }
-    val matchingArtists = remember(normalizedQuery, artists) {
-        if (normalizedQuery.isBlank()) emptyList() else artists.filter {
-            it.name.lowercase().contains(normalizedQuery)
-        }.take(100)
+    val matchingArtists = remember(normalizedQuery, searchField, artists) {
+        if (normalizedQuery.isBlank() || (searchField != SearchField.ALL && searchField != SearchField.ARTIST)) emptyList()
+        else artists.filter { it.name.lowercase().contains(normalizedQuery) }.take(100)
     }
 
     Box(Modifier.fillMaxSize()) {
@@ -650,6 +705,8 @@ private fun LibraryHome(
 
             SlimSearchBar(
                 query = query,
+                searchField = searchField,
+                onSearchFieldChange = { searchField = it },
                 onQueryChange = {
                     query = it
                     searchOpen = it.isNotBlank()
@@ -687,7 +744,11 @@ private fun LibraryHome(
                     onPlayNextItems = onPlayNextItems,
                     onAddToNowPlaying = onAddToNowPlaying
                 )
-                LibraryTab.PLAYLISTS -> EmptyPlaylists()
+                LibraryTab.PLAYLISTS -> PlaylistList(
+                    playlists = playlists,
+                    onSelect = { openPlaylist(it) },
+                    onCreate = { createPlaylistOpen = true }
+                )
             }
         }
 
@@ -728,6 +789,10 @@ private fun LibraryHome(
                     settingsOpen = true
                     toolsOpen = false
                 },
+                onAbout = {
+                    aboutOpen = true
+                    toolsOpen = false
+                },
                 onReconnect = {
                     onReconnectServer()
                     toolsOpen = false
@@ -747,6 +812,8 @@ private fun LibraryHome(
         if (searchOpen) {
             SearchOverlay(
                 query = query,
+                searchField = searchField,
+                onSearchFieldChange = { searchField = it },
                 albums = matchingAlbums,
                 artists = matchingArtists,
                 songs = matchingSongs,
@@ -830,61 +897,39 @@ private fun LibraryHome(
                 onPlayNextItems = onPlayNextItems,
                 onAddToPlaylist = { },
                 onRemoveIndex = onRemoveQueueIndex,
+                onClear = onClearNowPlaying,
                 onClose = { queueOpen = false }
             )
         }
 
         if (settingsOpen) {
-            ArtworkSettingsOverlay(
-                settings = settings,
-                onClose = { settingsOpen = false }
-            )
+            ArtworkSettingsOverlay(settings = settings, onClose = { settingsOpen = false })
+        }
+        if (aboutOpen) {
+            AboutOverlay(tracks.size, albums.size, artists.size) { aboutOpen = false }
         }
     }
 }
 
 @Composable
 private fun SlimSearchBar(
-    query: String,
-    onQueryChange: (String) -> Unit,
-    onSettings: () -> Unit
+    query: String, searchField: SearchField, onSearchFieldChange: (SearchField) -> Unit,
+    onQueryChange: (String) -> Unit, onSettings: () -> Unit
 ) {
     val configuration = LocalConfiguration.current
     val tablet = configuration.screenWidthDp >= 600
-    val horizontalPadding = if (tablet) 14.dp else 7.dp
-
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = horizontalPadding, vertical = 3.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp)
-    ) {
-        OutlinedTextField(
-            value = query,
-            onValueChange = onQueryChange,
-            modifier = Modifier.weight(1f),
-            singleLine = true,
-            placeholder = {
-                Text(
-                    "Search music…",
-                    style = MaterialTheme.typography.bodyMedium
-                )
-            },
-            textStyle = MaterialTheme.typography.bodyMedium,
-            shape = RoundedCornerShape(7.dp)
-        )
-
-        OutlinedButton(
-            onClick = onSettings,
-            modifier = Modifier
-                .width(54.dp)
-                .height(56.dp),
-            contentPadding = PaddingValues(0.dp),
-            shape = RoundedCornerShape(7.dp)
-        ) {
-            Text("⚙", style = MaterialTheme.typography.titleMedium)
+    var fieldMenuOpen by remember { mutableStateOf(false) }
+    Row(Modifier.fillMaxWidth().padding(horizontal = if (tablet) 14.dp else 7.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Box {
+            OutlinedButton(onClick = { fieldMenuOpen = true }, modifier = Modifier.height(56.dp), contentPadding = PaddingValues(horizontal = 10.dp)) { Text("${searchField.label} ▾") }
+            DropdownMenu(expanded = fieldMenuOpen, onDismissRequest = { fieldMenuOpen = false }) {
+                SearchField.entries.forEach { field -> DropdownMenuItem(text = { Text(field.label) }, onClick = { onSearchFieldChange(field); fieldMenuOpen = false }) }
+            }
         }
+        OutlinedTextField(value = query, onValueChange = onQueryChange, modifier = Modifier.weight(1f), singleLine = true,
+            placeholder = { Text("Search ${searchField.label.lowercase()}…") }, shape = RoundedCornerShape(7.dp))
+        OutlinedButton(onClick = onSettings, modifier = Modifier.width(54.dp).height(56.dp), contentPadding = PaddingValues(0.dp), shape = RoundedCornerShape(7.dp)) { Text("⚙") }
     }
 }
 
@@ -902,6 +947,7 @@ private fun ToolsModal(
     onRandom100: () -> Unit,
     onCreatePlaylist: () -> Unit,
     onArtworkSettings: () -> Unit,
+    onAbout: () -> Unit,
     onReconnect: () -> Unit,
     onRefresh: () -> Unit,
     onChangeServer: () -> Unit,
@@ -940,6 +986,7 @@ private fun ToolsModal(
                 SideAction("Random 100", "Create a temporary 100-track selection", onRandom100)
                 SideAction("Create Playlist", "Make a new playlist for your library", onCreatePlaylist)
                 SideAction("Artwork", "Caching and missing-cover options", onArtworkSettings)
+                SideAction("About", "App information and library statistics", onAbout)
 
                 HorizontalDivider(Modifier.padding(vertical = 8.dp))
 
@@ -991,6 +1038,8 @@ private fun SideAction(
 @Composable
 private fun SearchOverlay(
     query: String,
+    searchField: SearchField,
+    onSearchFieldChange: (SearchField) -> Unit,
     albums: List<MusicAlbum>,
     artists: List<MusicArtist>,
     songs: List<MusicTrack>,
@@ -1019,13 +1068,16 @@ private fun SearchOverlay(
                 TextButton(onClick = onClose) { Text("Close") }
             }
 
-            OutlinedTextField(
-                value = query,
-                onValueChange = onQueryChange,
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true,
-                label = { Text("Title, artist, release, genre or year") }
-            )
+            var fieldMenuOpen by remember { mutableStateOf(false) }
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Box {
+                    OutlinedButton(onClick = { fieldMenuOpen = true }) { Text("${searchField.label} ▾") }
+                    DropdownMenu(expanded = fieldMenuOpen, onDismissRequest = { fieldMenuOpen = false }) {
+                        SearchField.entries.forEach { field -> DropdownMenuItem(text = { Text(field.label) }, onClick = { onSearchFieldChange(field); fieldMenuOpen = false }) }
+                    }
+                }
+                OutlinedTextField(value = query, onValueChange = onQueryChange, modifier = Modifier.weight(1f), singleLine = true, label = { Text("Search ${searchField.label.lowercase()}") })
+            }
 
             if (query.isBlank()) {
                 Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -1374,9 +1426,11 @@ private fun NowPlayingQueueOverlay(
     onPlayNextItems: (List<MusicTrack>) -> Unit,
     onAddToPlaylist: (MusicTrack) -> Unit,
     onRemoveIndex: (Int) -> Unit,
+    onClear: () -> Unit,
     onClose: () -> Unit
 ) {
     BackHandler(onBack = onClose)
+    var confirmClear by remember { mutableStateOf(false) }
     var menuIndex by remember { mutableStateOf<Int?>(null) }
     var infoTrack by remember { mutableStateOf<MusicTrack?>(null) }
     var playlistTrack by remember { mutableStateOf<MusicTrack?>(null) }
@@ -1391,7 +1445,8 @@ private fun NowPlayingQueueOverlay(
                     Text("Now Playing", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                     Text("${queue.size} tracks in queue", style = MaterialTheme.typography.labelSmall)
                 }
-                TextButton(onClick = onClose) { Text("Close") }
+                if (queue.isNotEmpty()) TextButton(onClick = { confirmClear = true }) { Text("Clear") }
+                TextButton(onClick = onClose) { Text("‹ Back") }
             }
             HorizontalDivider()
 
@@ -1446,6 +1501,16 @@ private fun NowPlayingQueueOverlay(
                 }
             }
         }
+    }
+
+    if (confirmClear) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("Clear Now Playing?") },
+            text = { Text("This will stop playback and remove every track from the queue.") },
+            confirmButton = { TextButton(onClick = { onClear(); confirmClear = false; onClose() }) { Text("Clear") } },
+            dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("Cancel") } }
+        )
     }
 
     menuIndex?.let { index ->
@@ -2139,11 +2204,56 @@ private fun PlaylistPickerDialog(
 }
 
 @Composable
-private fun EmptyPlaylists() {
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text("Playlists", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-            Text("User playlists are coming next.")
+private fun PlaylistList(playlists: List<MusicPlaylist>, onSelect: (MusicPlaylist) -> Unit, onCreate: () -> Unit) {
+    Column(Modifier.fillMaxSize()) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("Playlists", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            TextButton(onClick = onCreate) { Text("+ New") }
+        }
+        if (playlists.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("No playlists yet.") }
+        else LazyColumn(contentPadding = PaddingValues(bottom = 80.dp)) {
+            items(playlists, key = { it.id }) { playlist ->
+                Row(Modifier.fillMaxWidth().clickable { onSelect(playlist) }.padding(horizontal = 12.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) { Text(playlist.name, fontWeight = FontWeight.SemiBold); Text("${playlist.trackCount} tracks", style = MaterialTheme.typography.labelSmall) }
+                    Text("›", style = MaterialTheme.typography.titleLarge)
+                }
+                HorizontalDivider()
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlaylistDetail(playlist: MusicPlaylist, tracks: List<MusicTrack>, database: MusicDatabase, onBack: () -> Unit,
+    onPlayQueue: (List<MusicTrack>, MusicTrack) -> Unit, onPlayNextItems: (List<MusicTrack>) -> Unit, onAddToNowPlaying: (List<MusicTrack>) -> Unit) {
+    BackHandler(onBack = onBack)
+    Column(Modifier.fillMaxSize()) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onBack) { Text("‹ Back") }
+            Column(Modifier.weight(1f)) { Text(playlist.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold); Text("${tracks.size} tracks", style = MaterialTheme.typography.labelSmall) }
+            Button(onClick = { tracks.firstOrNull()?.let { onPlayQueue(tracks, it) } }, enabled = tracks.isNotEmpty()) { Text("Play") }
+        }
+        HorizontalDivider()
+        SongList(tracks = tracks, database = database, onPlayTrack = { onPlayQueue(tracks, it) }, onPlayNextItems = onPlayNextItems, onAddToNowPlaying = onAddToNowPlaying)
+    }
+}
+
+@Composable
+private fun AboutOverlay(songCount: Int, albumCount: Int, artistCount: Int, onClose: () -> Unit) {
+    val context = LocalContext.current
+    val packageInfo = remember { runCatching { context.packageManager.getPackageInfo(context.packageName, 0) }.getOrNull() }
+    BackHandler(onBack = onClose)
+    Surface(Modifier.fillMaxSize(), tonalElevation = 8.dp) {
+        Column(Modifier.fillMaxSize().padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) { TextButton(onClick = onClose) { Text("‹ Back") }; Text("About", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold) }
+            Spacer(Modifier.height(18.dp))
+            Text("DLNA Music", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            Text("by STUDORIUM")
+            Spacer(Modifier.height(14.dp))
+            InfoLine("Version", packageInfo?.versionName ?: "Unknown")
+            InfoLine("Library", "$songCount songs • $albumCount releases • $artistCount artists")
+            Spacer(Modifier.height(14.dp))
+            Text("A music-focused Android player for browsing and playing personal DLNA music libraries.")
         }
     }
 }
