@@ -33,6 +33,9 @@ import androidx.media3.common.MediaItem
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import android.content.ComponentName
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import java.net.HttpURLConnection
 import java.net.URL
 import androidx.media3.common.Player
@@ -45,6 +48,34 @@ import com.google.common.util.concurrent.MoreExecutors
 private enum class LibraryTab { ALBUMS, ARTISTS, SONGS, PLAYLISTS }
 private enum class SearchField(val label: String) {
     ALL("All"), ARTIST("Artist"), ALBUM("Album"), SONG("Song"), GENRE("Genre"), YEAR("Year")
+}
+
+private enum class TrackSort(val label: String) {
+    ORDER("Current order"), TITLE("Title"), ARTIST("Artist"), ALBUM("Album"), TRACK("Track"), YEAR("Year"), DURATION("Duration")
+}
+
+private fun durationSeconds(value: String): Long {
+    val parts = value.substringBefore(".").split(":").mapNotNull { it.toLongOrNull() }
+    return when (parts.size) {
+        3 -> parts[0] * 3600L + parts[1] * 60L + parts[2]
+        2 -> parts[0] * 60L + parts[1]
+        1 -> parts[0]
+        else -> 0L
+    }
+}
+
+private fun sortedTracks(source: List<MusicTrack>, sort: TrackSort, ascending: Boolean): List<MusicTrack> {
+    if (sort == TrackSort.ORDER) return source
+    val comparator = when (sort) {
+        TrackSort.TITLE -> compareBy<MusicTrack> { it.title.lowercase() }.thenBy { it.artist.lowercase() }
+        TrackSort.ARTIST -> compareBy<MusicTrack> { it.artist.lowercase() }.thenBy { it.album.lowercase() }.thenBy { it.trackNumber ?: Int.MAX_VALUE }
+        TrackSort.ALBUM -> compareBy<MusicTrack> { it.album.lowercase() }.thenBy { it.trackNumber ?: Int.MAX_VALUE }.thenBy { it.title.lowercase() }
+        TrackSort.TRACK -> compareBy<MusicTrack> { it.trackNumber ?: Int.MAX_VALUE }.thenBy { it.title.lowercase() }
+        TrackSort.YEAR -> compareBy<MusicTrack> { it.year }.thenBy { it.album.lowercase() }.thenBy { it.trackNumber ?: Int.MAX_VALUE }
+        TrackSort.DURATION -> compareBy<MusicTrack> { durationSeconds(it.duration) }.thenBy { it.title.lowercase() }
+        TrackSort.ORDER -> compareBy { 0 }
+    }
+    return source.sortedWith(if (ascending) comparator else comparator.reversed())
 }
 
 class MainActivity : ComponentActivity() {
@@ -67,6 +98,8 @@ class MainActivity : ComponentActivity() {
                 var playbackQueue by remember { mutableStateOf<List<MusicTrack>>(emptyList()) }
                 var playbackPositionMs by remember { mutableLongStateOf(0L) }
                 var playbackDurationMs by remember { mutableLongStateOf(0L) }
+                var shuffleEnabled by remember { mutableStateOf(false) }
+                var repeatMode by remember { mutableIntStateOf(Player.REPEAT_MODE_OFF) }
 
                 DisposableEffect(Unit) {
                     val sessionToken = SessionToken(
@@ -82,6 +115,8 @@ class MainActivity : ComponentActivity() {
                                 controller = builtController
                                 isPlaying = builtController.isPlaying
                                 isBuffering = builtController.playbackState == Player.STATE_BUFFERING
+                                shuffleEnabled = builtController.shuffleModeEnabled
+                                repeatMode = builtController.repeatMode
 
                                 builtController.currentMediaItem?.mediaId?.toLongOrNull()?.let { id ->
                                     nowPlaying = playbackQueue.firstOrNull { it.databaseId == id }
@@ -120,6 +155,14 @@ class MainActivity : ComponentActivity() {
 
                             override fun onPlaybackStateChanged(playbackState: Int) {
                                 isBuffering = playbackState == Player.STATE_BUFFERING
+                            }
+
+                            override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
+                                shuffleEnabled = shuffleModeEnabled
+                            }
+
+                            override fun onRepeatModeChanged(newRepeatMode: Int) {
+                                repeatMode = newRepeatMode
                             }
 
                             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
@@ -255,6 +298,22 @@ class MainActivity : ComponentActivity() {
                     syncPlaybackQueueFromController(activeController, playable)
                 }
 
+                fun toggleShuffle() {
+                    val activeController = controller ?: return
+                    activeController.shuffleModeEnabled = !activeController.shuffleModeEnabled
+                    shuffleEnabled = activeController.shuffleModeEnabled
+                }
+
+                fun cycleRepeatMode() {
+                    val activeController = controller ?: return
+                    activeController.repeatMode = when (activeController.repeatMode) {
+                        Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
+                        Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
+                        else -> Player.REPEAT_MODE_OFF
+                    }
+                    repeatMode = activeController.repeatMode
+                }
+
                 fun seekTo(positionMs: Long) {
                     controller?.seekTo(positionMs.coerceAtLeast(0L))
                     playbackPositionMs = positionMs.coerceAtLeast(0L)
@@ -275,6 +334,20 @@ class MainActivity : ComponentActivity() {
                     playbackQueue = playbackQueue.toMutableList().apply {
                         if (index in indices) removeAt(index)
                     }
+                }
+
+                fun reorderNowPlaying(items: List<MusicTrack>) {
+                    val activeController = controller ?: return
+                    if (items.isEmpty()) return
+                    val currentUrl = nowPlaying?.resourceUrl
+                    val currentPosition = activeController.currentPosition.coerceAtLeast(0L)
+                    val shouldPlay = activeController.playWhenReady
+                    val newIndex = items.indexOfFirst { it.resourceUrl == currentUrl }.let { if (it >= 0) it else 0 }
+                    playbackQueue = items
+                    nowPlaying = items[newIndex]
+                    activeController.setMediaItems(items.map { musicMediaItem(it) }, newIndex, currentPosition)
+                    activeController.prepare()
+                    if (shouldPlay) activeController.play() else activeController.pause()
                 }
 
                 fun clearNowPlaying() {
@@ -454,6 +527,10 @@ class MainActivity : ComponentActivity() {
                             playbackQueue = playbackQueue,
                             playbackPositionMs = playbackPositionMs,
                             playbackDurationMs = playbackDurationMs,
+                            shuffleEnabled = shuffleEnabled,
+                            repeatMode = repeatMode,
+                            onToggleShuffle = { toggleShuffle() },
+                            onCycleRepeat = { cycleRepeatMode() },
                             onPlayTrack = { playTrack(it) },
                             onPlayQueue = { queue, track -> playQueue(queue, track) },
                             onTogglePlayback = { togglePlayback() },
@@ -464,6 +541,7 @@ class MainActivity : ComponentActivity() {
                             onSeek = { seekTo(it) },
                             onJumpToQueueIndex = { jumpToQueueIndex(it) },
                             onRemoveQueueIndex = { removeQueueIndex(it) },
+                            onReorderNowPlaying = { reorderNowPlaying(it) },
                             onClearNowPlaying = { clearNowPlaying() },
                             selectedAlbum = selectedAlbum,
                             albumTracks = albumTracks,
@@ -553,6 +631,10 @@ private fun LibraryHome(
     playbackQueue: List<MusicTrack>,
     playbackPositionMs: Long,
     playbackDurationMs: Long,
+    shuffleEnabled: Boolean,
+    repeatMode: Int,
+    onToggleShuffle: () -> Unit,
+    onCycleRepeat: () -> Unit,
     onPlayTrack: (MusicTrack) -> Unit,
     onPlayQueue: (List<MusicTrack>, MusicTrack) -> Unit,
     onTogglePlayback: () -> Unit,
@@ -563,6 +645,7 @@ private fun LibraryHome(
     onSeek: (Long) -> Unit,
     onJumpToQueueIndex: (Int) -> Unit,
     onRemoveQueueIndex: (Int) -> Unit,
+    onReorderNowPlaying: (List<MusicTrack>) -> Unit,
     onClearNowPlaying: () -> Unit,
     selectedAlbum: MusicAlbum?,
     albumTracks: List<MusicTrack>,
@@ -588,6 +671,7 @@ private fun LibraryHome(
     var playlistTracks by remember { mutableStateOf<List<MusicTrack>>(emptyList()) }
     var selectedArtist by remember { mutableStateOf<MusicArtist?>(null) }
     var randomTracks by remember { mutableStateOf<List<MusicTrack>>(emptyList()) }
+    var discoveryOpen by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(tab, createPlaylistOpen) {
@@ -699,7 +783,7 @@ private fun LibraryHome(
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize()) {
-            Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.height(24.dp))
 
             SlimLibraryTabs(tab) { tab = it }
 
@@ -741,6 +825,7 @@ private fun LibraryHome(
                     tracks = tracks,
                     database = database,
                     onPlayTrack = { track -> onPlayTrack(track) },
+                    onPlayQueue = onPlayQueue,
                     onPlayNextItems = onPlayNextItems,
                     onAddToNowPlaying = onAddToNowPlaying
                 )
@@ -781,6 +866,10 @@ private fun LibraryHome(
                         toolsOpen = false
                     }
                 },
+                onDiscover = {
+                    discoveryOpen = true
+                    toolsOpen = false
+                },
                 onCreatePlaylist = {
                     createPlaylistOpen = true
                     toolsOpen = false
@@ -815,6 +904,7 @@ private fun LibraryHome(
                 searchField = searchField,
                 onSearchFieldChange = { searchField = it },
                 albums = matchingAlbums,
+                allAlbums = albums,
                 artists = matchingArtists,
                 songs = matchingSongs,
                 onQueryChange = { query = it },
@@ -825,9 +915,18 @@ private fun LibraryHome(
                 onSelectArtist = { artist -> selectedArtist = artist },
                 database = database,
                 onPlayTrack = onPlayTrack,
+                onPlayQueue = onPlayQueue,
                 onPlayNextItems = onPlayNextItems,
                 onAddToNowPlaying = onAddToNowPlaying,
                 onClose = { searchOpen = false }
+            )
+        }
+
+        if (discoveryOpen) {
+            DiscoveryOverlay(
+                tracks = tracks,
+                onPlayQueue = onPlayQueue,
+                onClose = { discoveryOpen = false }
             )
         }
 
@@ -853,7 +952,7 @@ private fun LibraryHome(
             )
         }
 
-        if (nowPlaying != null && !searchOpen && !randomOpen && !settingsOpen && !createPlaylistOpen && !nowPlayingOpen && !queueOpen && !toolsOpen) {
+        if (nowPlaying != null && !searchOpen && !randomOpen && !discoveryOpen && !settingsOpen && !createPlaylistOpen && !nowPlayingOpen && !queueOpen && !toolsOpen) {
             NowPlayingBar(
                 track = nowPlaying,
                 isPlaying = isPlaying,
@@ -876,6 +975,10 @@ private fun LibraryHome(
                 positionMs = playbackPositionMs,
                 durationMs = playbackDurationMs,
                 queueSize = playbackQueue.size,
+                shuffleEnabled = shuffleEnabled,
+                repeatMode = repeatMode,
+                onToggleShuffle = onToggleShuffle,
+                onCycleRepeat = onCycleRepeat,
                 onPrevious = onPrevious,
                 onTogglePlayback = onTogglePlayback,
                 onNext = onNext,
@@ -897,6 +1000,7 @@ private fun LibraryHome(
                 onPlayNextItems = onPlayNextItems,
                 onAddToPlaylist = { },
                 onRemoveIndex = onRemoveQueueIndex,
+                onReorder = onReorderNowPlaying,
                 onClear = onClearNowPlaying,
                 onClose = { queueOpen = false }
             )
@@ -945,6 +1049,7 @@ private fun ToolsModal(
     nowPlayingAvailable: Boolean,
     onNowPlaying: () -> Unit,
     onRandom100: () -> Unit,
+    onDiscover: () -> Unit,
     onCreatePlaylist: () -> Unit,
     onArtworkSettings: () -> Unit,
     onAbout: () -> Unit,
@@ -983,6 +1088,7 @@ private fun ToolsModal(
                     onNowPlaying,
                     enabled = nowPlayingAvailable
                 )
+                SideAction("Discover Music", "Random song, album, artist or 100-track mix", onDiscover)
                 SideAction("Random 100", "Create a temporary 100-track selection", onRandom100)
                 SideAction("Create Playlist", "Make a new playlist for your library", onCreatePlaylist)
                 SideAction("Artwork", "Caching and missing-cover options", onArtworkSettings)
@@ -1041,6 +1147,7 @@ private fun SearchOverlay(
     searchField: SearchField,
     onSearchFieldChange: (SearchField) -> Unit,
     albums: List<MusicAlbum>,
+    allAlbums: List<MusicAlbum>,
     artists: List<MusicArtist>,
     songs: List<MusicTrack>,
     onQueryChange: (String) -> Unit,
@@ -1048,6 +1155,7 @@ private fun SearchOverlay(
     onSelectArtist: (MusicArtist) -> Unit,
     database: MusicDatabase,
     onPlayTrack: (MusicTrack) -> Unit,
+    onPlayQueue: (List<MusicTrack>, MusicTrack) -> Unit,
     onPlayNextItems: (List<MusicTrack>) -> Unit,
     onAddToNowPlaying: (List<MusicTrack>) -> Unit,
     onClose: () -> Unit
@@ -1059,10 +1167,18 @@ private fun SearchOverlay(
     var infoAlbum by remember { mutableStateOf<MusicAlbum?>(null) }
     var playlistTracks by remember { mutableStateOf<List<MusicTrack>?>(null) }
     var bulkTracks by remember { mutableStateOf<List<MusicTrack>?>(null) }
+    var selectedTracks by remember { mutableStateOf<List<MusicTrack>>(emptyList()) }
+    var selectedForPlaylist by remember { mutableStateOf<List<MusicTrack>?>(null) }
     val scope = rememberCoroutineScope()
 
+    fun toggleSelected(track: MusicTrack) {
+        selectedTracks = if (selectedTracks.any { it.resourceUrl == track.resourceUrl })
+            selectedTracks.filterNot { it.resourceUrl == track.resourceUrl }
+        else selectedTracks + track
+    }
+
     Surface(Modifier.fillMaxSize(), tonalElevation = 8.dp) {
-        Column(Modifier.fillMaxSize().padding(10.dp)) {
+        Column(Modifier.fillMaxSize().padding(start = 10.dp, end = 10.dp, top = 24.dp, bottom = 10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Search", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                 TextButton(onClick = onClose) { Text("Close") }
@@ -1142,8 +1258,19 @@ private fun SearchOverlay(
                         items(songs, key = { "song:${it.resourceUrl}" }) { track ->
                             TrackRow(
                                 track = track,
-                                onClick = { onPlayTrack(track) },
-                                onLongClick = { menuTrack = track }
+                                selected = selectedTracks.any { it.resourceUrl == track.resourceUrl },
+                                onClick = { if (selectedTracks.isNotEmpty()) toggleSelected(track) else onPlayTrack(track) },
+                                onLongClick = {
+                                    if (selectedTracks.isNotEmpty()) {
+                                        if (selectedTracks.any { it.resourceUrl == track.resourceUrl }) {
+                                            bulkTracks = selectedTracks
+                                        } else {
+                                            toggleSelected(track)
+                                        }
+                                    } else {
+                                        menuTrack = track
+                                    }
+                                }
                             )
                             HorizontalDivider()
                         }
@@ -1160,22 +1287,136 @@ private fun SearchOverlay(
     }
 
     menuTrack?.let { track ->
-        ItemActionDialog(
-            title = track.title,
-            infoLabel = "Song Info",
-            onDismiss = { menuTrack = null },
-            onSelectAll = { bulkTracks = songs; menuTrack = null },
-            onPlayNext = { onPlayNextItems(listOf(track)); menuTrack = null },
-            onAddToNowPlaying = { onAddToNowPlaying(listOf(track)); menuTrack = null },
-            onAddToPlaylist = { playlistTrack = track; menuTrack = null },
-            onInfo = { infoTrack = track; menuTrack = null }
+        AlertDialog(
+            onDismissRequest = { menuTrack = null },
+            title = { Text(track.title, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+            text = {
+                Column {
+                    TextButton(
+                        onClick = {
+                            selectedTracks = listOf(track)
+                            menuTrack = null
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Multi-select") }
+                    TextButton(onClick = { onPlayNextItems(listOf(track)); menuTrack = null }, modifier = Modifier.fillMaxWidth()) { Text("Play Next") }
+                    TextButton(onClick = { onAddToNowPlaying(listOf(track)); menuTrack = null }, modifier = Modifier.fillMaxWidth()) { Text("Add to Now Playing") }
+                    TextButton(onClick = { playlistTrack = track; menuTrack = null }, modifier = Modifier.fillMaxWidth()) { Text("Add to Playlist") }
+                    TextButton(
+                        onClick = {
+                            allAlbums.firstOrNull { it.title.equals(track.album, true) && it.artist.equals(track.artist, true) }?.let(onSelectAlbum)
+                            menuTrack = null
+                        },
+                        enabled = track.album.isNotBlank(),
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Show Album") }
+                    TextButton(onClick = { infoTrack = track; menuTrack = null }, modifier = Modifier.fillMaxWidth()) { Text("Song Info") }
+                }
+            },
+            confirmButton = { TextButton(onClick = { menuTrack = null }) { Text("Cancel") } }
+        )
+    }
+    bulkTracks?.let { selected ->
+        BulkSelectionDialog(
+            count = selected.size,
+            onDismiss = { bulkTracks = null },
+            onPlayNow = { selected.firstOrNull()?.let { onPlayQueue(selected, it) }; bulkTracks = null; selectedTracks = emptyList() },
+            onPlayNext = { onPlayNextItems(selected); bulkTracks = null; selectedTracks = emptyList() },
+            onAddToNowPlaying = { onAddToNowPlaying(selected); bulkTracks = null; selectedTracks = emptyList() },
+            onAddToPlaylist = { selectedForPlaylist = selected; bulkTracks = null }
         )
     }
     infoTrack?.let { SongInfoDialog(it) { infoTrack = null } }
     playlistTrack?.let {
         PlaylistPickerDialog(database, listOf(it)) { playlistTrack = null }
     }
+    selectedForPlaylist?.let { selected ->
+        PlaylistPickerDialog(database, selected) { selectedForPlaylist = null; selectedTracks = emptyList() }
+    }
+    menuAlbum?.let { album ->
+        AlertDialog(
+            onDismissRequest = { menuAlbum = null },
+            title = { Text(album.title, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+            text = {
+                Column {
+                    TextButton(onClick = { onSelectAlbum(album); menuAlbum = null }, modifier = Modifier.fillMaxWidth()) { Text("Show Album") }
+                    TextButton(
+                        onClick = { scope.launch { val albumSongs = withContext(Dispatchers.IO) { database.getTracksForAlbum(album) }; onPlayNextItems(albumSongs); menuAlbum = null } },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Play Next") }
+                    TextButton(
+                        onClick = { scope.launch { val albumSongs = withContext(Dispatchers.IO) { database.getTracksForAlbum(album) }; onAddToNowPlaying(albumSongs); menuAlbum = null } },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Add Album to Now Playing") }
+                    TextButton(
+                        onClick = { scope.launch { selectedTracks = (selectedTracks + withContext(Dispatchers.IO) { database.getTracksForAlbum(album) }).distinctBy { it.resourceUrl }; menuAlbum = null } },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Select Album") }
+                    TextButton(
+                        onClick = { scope.launch { playlistTracks = withContext(Dispatchers.IO) { database.getTracksForAlbum(album) }; menuAlbum = null } },
+                        modifier = Modifier.fillMaxWidth()
+                    ) { Text("Add Album to Playlist") }
+                    TextButton(onClick = { infoAlbum = album; menuAlbum = null }, modifier = Modifier.fillMaxWidth()) { Text("Album Info") }
+                }
+            },
+            confirmButton = { TextButton(onClick = { menuAlbum = null }) { Text("Cancel") } }
+        )
+    }
+    infoAlbum?.let { AlbumInfoDialog(it) { infoAlbum = null } }
+    playlistTracks?.let { albumSongs -> PlaylistPickerDialog(database, albumSongs) { playlistTracks = null } }
 
+}
+
+@Composable
+private fun DiscoveryOverlay(
+    tracks: List<MusicTrack>,
+    onPlayQueue: (List<MusicTrack>, MusicTrack) -> Unit,
+    onClose: () -> Unit
+) {
+    BackHandler(onBack = onClose)
+    var resultTitle by remember { mutableStateOf("Choose a discovery mode") }
+    var result by remember { mutableStateOf<List<MusicTrack>>(emptyList()) }
+
+    fun randomSong() {
+        result = tracks.randomOrNull()?.let { listOf(it) } ?: emptyList()
+        resultTitle = "Random Song"
+    }
+    fun randomAlbum() {
+        val album = tracks.map { it.album }.filter { it.isNotBlank() }.distinct().randomOrNull()
+        result = if (album == null) emptyList() else tracks.filter { it.album == album }.sortedBy { it.trackNumber ?: Int.MAX_VALUE }
+        resultTitle = if (album.isNullOrBlank()) "Random Album" else album
+    }
+    fun randomArtist() {
+        val artist = tracks.map { it.artist }.filter { it.isNotBlank() }.distinct().randomOrNull()
+        result = if (artist == null) emptyList() else tracks.filter { it.artist == artist }.shuffled().take(100)
+        resultTitle = if (artist.isNullOrBlank()) "Random Artist" else artist
+    }
+    fun random100() {
+        result = tracks.shuffled().take(100)
+        resultTitle = "Random 100"
+    }
+
+    Surface(Modifier.fillMaxSize(), tonalElevation = 8.dp) {
+        Column(Modifier.fillMaxSize().padding(top = 24.dp)) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("Discover Music", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                TextButton(onClick = onClose) { Text("‹ Back") }
+            }
+            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                OutlinedButton(onClick = { randomSong() }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 2.dp)) { Text("Song") }
+                OutlinedButton(onClick = { randomAlbum() }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 2.dp)) { Text("Album") }
+                OutlinedButton(onClick = { randomArtist() }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 2.dp)) { Text("Artist") }
+                OutlinedButton(onClick = { random100() }, modifier = Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 2.dp)) { Text("100") }
+            }
+            Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(resultTitle, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Button(onClick = { result.firstOrNull()?.let { onPlayQueue(result, it) } }, enabled = result.isNotEmpty()) { Text("Play") }
+            }
+            HorizontalDivider()
+            if (result.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("Pick a discovery option above.") }
+            else SongList(tracks = result, onPlayTrack = { onPlayQueue(result, it) })
+        }
+    }
 }
 
 @Composable
@@ -1330,6 +1571,10 @@ private fun NowPlayingOverlay(
     positionMs: Long,
     durationMs: Long,
     queueSize: Int,
+    shuffleEnabled: Boolean,
+    repeatMode: Int,
+    onToggleShuffle: () -> Unit,
+    onCycleRepeat: () -> Unit,
     onPrevious: () -> Unit,
     onTogglePlayback: () -> Unit,
     onNext: () -> Unit,
@@ -1340,6 +1585,7 @@ private fun NowPlayingOverlay(
     BackHandler(onBack = onClose)
     var scrubPosition by remember(track.resourceUrl) { mutableFloatStateOf(positionMs.toFloat()) }
     var scrubbing by remember { mutableStateOf(false) }
+    var showSongInfo by remember { mutableStateOf(false) }
 
     LaunchedEffect(positionMs, scrubbing) {
         if (!scrubbing) scrubPosition = positionMs.toFloat()
@@ -1353,6 +1599,7 @@ private fun NowPlayingOverlay(
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onClose) { Text("‹ Back") }
                 Spacer(Modifier.weight(1f))
+                TextButton(onClick = { showSongInfo = true }) { Text("Info") }
                 TextButton(onClick = onOpenQueue) { Text("Queue ($queueSize)") }
             }
 
@@ -1403,7 +1650,25 @@ private fun NowPlayingOverlay(
                 )
             }
 
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(8.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TextButton(onClick = onToggleShuffle) {
+                    Text(if (shuffleEnabled) "Shuffle ✓" else "Shuffle")
+                }
+                TextButton(onClick = onCycleRepeat) {
+                    Text(when (repeatMode) {
+                        Player.REPEAT_MODE_ALL -> "Repeat All ✓"
+                        Player.REPEAT_MODE_ONE -> "Repeat One ✓"
+                        else -> "Repeat Off"
+                    })
+                }
+            }
+
+            Spacer(Modifier.height(4.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {
                 TextButton(onClick = onPrevious) { Text("◀ Previous") }
                 Spacer(Modifier.width(12.dp))
@@ -1414,6 +1679,10 @@ private fun NowPlayingOverlay(
                 TextButton(onClick = onNext) { Text("Next ▶") }
             }
         }
+    }
+
+    if (showSongInfo) {
+        SongInfoDialog(track) { showSongInfo = false }
     }
 }
 
@@ -1426,6 +1695,7 @@ private fun NowPlayingQueueOverlay(
     onPlayNextItems: (List<MusicTrack>) -> Unit,
     onAddToPlaylist: (MusicTrack) -> Unit,
     onRemoveIndex: (Int) -> Unit,
+    onReorder: (List<MusicTrack>) -> Unit,
     onClear: () -> Unit,
     onClose: () -> Unit
 ) {
@@ -1434,6 +1704,10 @@ private fun NowPlayingQueueOverlay(
     var menuIndex by remember { mutableStateOf<Int?>(null) }
     var infoTrack by remember { mutableStateOf<MusicTrack?>(null) }
     var playlistTrack by remember { mutableStateOf<MusicTrack?>(null) }
+    var sortMenuOpen by remember { mutableStateOf(false) }
+    var sortField by remember { mutableStateOf(TrackSort.ORDER) }
+    var ascending by remember { mutableStateOf(true) }
+    val displayedQueue = remember(queue, sortField, ascending) { sortedTracks(queue, sortField, ascending) }
 
     Surface(Modifier.fillMaxSize(), tonalElevation = 8.dp) {
         Column(Modifier.fillMaxSize()) {
@@ -1445,7 +1719,25 @@ private fun NowPlayingQueueOverlay(
                     Text("Now Playing", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                     Text("${queue.size} tracks in queue", style = MaterialTheme.typography.labelSmall)
                 }
-                if (queue.isNotEmpty()) TextButton(onClick = { confirmClear = true }) { Text("Clear") }
+                if (queue.isNotEmpty()) {
+                    Box {
+                        TextButton(onClick = { sortMenuOpen = true }) { Text("Sort") }
+                        DropdownMenu(expanded = sortMenuOpen, onDismissRequest = { sortMenuOpen = false }) {
+                            TrackSort.entries.forEach { option ->
+                                DropdownMenuItem(text = { Text(option.label) }, onClick = {
+                                    sortField = option
+                                    sortMenuOpen = false
+                                    if (option == TrackSort.ORDER) ascending = true
+                                })
+                            }
+                            if (sortField != TrackSort.ORDER) {
+                                DropdownMenuItem(text = { Text(if (ascending) "Descending" else "Ascending") }, onClick = { ascending = !ascending; sortMenuOpen = false })
+                                DropdownMenuItem(text = { Text("Apply order to queue") }, onClick = { onReorder(displayedQueue); sortField = TrackSort.ORDER; ascending = true; sortMenuOpen = false })
+                            }
+                        }
+                    }
+                    TextButton(onClick = { confirmClear = true }) { Text("Clear") }
+                }
                 TextButton(onClick = onClose) { Text("‹ Back") }
             }
             HorizontalDivider()
@@ -1456,8 +1748,9 @@ private fun NowPlayingQueueOverlay(
                 }
             } else {
                 LazyColumn(contentPadding = PaddingValues(bottom = 20.dp)) {
-                    items(queue.size) { index ->
-                        val track = queue[index]
+                    items(displayedQueue.size) { index ->
+                        val track = displayedQueue[index]
+                        val queueIndex = queue.indexOfFirst { it.resourceUrl == track.resourceUrl }.let { if (it >= 0) it else index }
                         val current = currentTrack?.resourceUrl == track.resourceUrl
                         Surface(
                             tonalElevation = if (current) 4.dp else 0.dp,
@@ -1465,8 +1758,8 @@ private fun NowPlayingQueueOverlay(
                                 .fillMaxWidth()
                                 .pointerInput(track.resourceUrl, index) {
                                     detectTapGestures(
-                                        onTap = { onJumpToIndex(index) },
-                                        onLongPress = { menuIndex = index }
+                                        onTap = { onJumpToIndex(queueIndex) },
+                                        onLongPress = { menuIndex = queueIndex }
                                     )
                                 }
                         ) {
@@ -1832,7 +2125,7 @@ private fun ArtistDetail(
 
     Column(Modifier.fillMaxSize()) {
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
+            Modifier.fillMaxWidth().padding(start = 8.dp, end = 8.dp, top = 20.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             TextButton(onClick = onBack) { Text("‹ Back") }
@@ -1843,15 +2136,15 @@ private fun ArtistDetail(
             }
         }
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 3.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             if (section == 0) {
-                Button(onClick = { section = 0 }, modifier = Modifier.weight(1f).height(34.dp)) { Text("Albums") }
-                OutlinedButton(onClick = { section = 1 }, modifier = Modifier.weight(1f).height(34.dp)) { Text("Tracks") }
+                Button(onClick = { section = 0 }, modifier = Modifier.weight(1f).height(44.dp)) { Text("Albums") }
+                OutlinedButton(onClick = { section = 1 }, modifier = Modifier.weight(1f).height(44.dp)) { Text("Tracks") }
             } else {
-                OutlinedButton(onClick = { section = 0 }, modifier = Modifier.weight(1f).height(34.dp)) { Text("Albums") }
-                Button(onClick = { section = 1 }, modifier = Modifier.weight(1f).height(34.dp)) { Text("Tracks") }
+                OutlinedButton(onClick = { section = 0 }, modifier = Modifier.weight(1f).height(44.dp)) { Text("Albums") }
+                Button(onClick = { section = 1 }, modifier = Modifier.weight(1f).height(44.dp)) { Text("Tracks") }
             }
         }
 
@@ -1869,6 +2162,7 @@ private fun ArtistDetail(
                 tracks = tracks,
                 database = database,
                 onPlayTrack = onPlayTrack,
+                onPlayQueue = onPlayQueue,
                 onPlayNextItems = onPlayNextItems,
                 onAddToNowPlaying = onAddToNowPlaying
             )
@@ -1881,6 +2175,7 @@ private fun SongList(
     tracks: List<MusicTrack>,
     database: MusicDatabase? = null,
     onPlayTrack: (MusicTrack) -> Unit = {},
+    onPlayQueue: ((List<MusicTrack>, MusicTrack) -> Unit)? = null,
     onPlayNextItems: (List<MusicTrack>) -> Unit = {},
     onAddToNowPlaying: (List<MusicTrack>) -> Unit = {}
 ) {
@@ -1888,14 +2183,38 @@ private fun SongList(
     var infoTrack by remember { mutableStateOf<MusicTrack?>(null) }
     var playlistTrack by remember { mutableStateOf<MusicTrack?>(null) }
     var playlistTracks by remember { mutableStateOf<List<MusicTrack>?>(null) }
+    var selectedTracks by remember { mutableStateOf<List<MusicTrack>>(emptyList()) }
     var bulkTracks by remember { mutableStateOf<List<MusicTrack>?>(null) }
+
+    fun toggleSelected(track: MusicTrack) {
+        selectedTracks = if (selectedTracks.any { it.resourceUrl == track.resourceUrl }) {
+            selectedTracks.filterNot { it.resourceUrl == track.resourceUrl }
+        } else {
+            selectedTracks + track
+        }
+    }
+
+    BackHandler(enabled = selectedTracks.isNotEmpty()) {
+        selectedTracks = emptyList()
+        bulkTracks = null
+    }
 
     LazyColumn(contentPadding = PaddingValues(bottom = 80.dp)) {
         items(tracks, key = { it.resourceUrl }) { track ->
+            val selected = selectedTracks.any { it.resourceUrl == track.resourceUrl }
             TrackRow(
                 track = track,
-                onClick = { onPlayTrack(track) },
-                onLongClick = { menuTrack = track }
+                selected = selected,
+                onClick = {
+                    if (selectedTracks.isNotEmpty()) toggleSelected(track) else onPlayTrack(track)
+                },
+                onLongClick = {
+                    if (selectedTracks.isNotEmpty()) {
+                        if (selected) bulkTracks = selectedTracks else toggleSelected(track)
+                    } else {
+                        menuTrack = track
+                    }
+                }
             )
             HorizontalDivider()
         }
@@ -1906,7 +2225,10 @@ private fun SongList(
             title = track.title,
             infoLabel = "Song Info",
             onDismiss = { menuTrack = null },
-            onSelectAll = { bulkTracks = tracks; menuTrack = null },
+            onMultiSelect = {
+                selectedTracks = listOf(track)
+                menuTrack = null
+            },
             onPlayNext = {
                 onPlayNextItems(listOf(track))
                 menuTrack = null
@@ -1926,26 +2248,48 @@ private fun SongList(
         )
     }
 
-    infoTrack?.let {
-        SongInfoDialog(it) { infoTrack = null }
+    bulkTracks?.let { selected ->
+        BulkSelectionDialog(
+            count = selected.size,
+            onDismiss = { bulkTracks = null },
+            onPlayNow = {
+                selected.firstOrNull()?.let { first ->
+                    if (onPlayQueue != null) onPlayQueue(selected, first) else onPlayTrack(first)
+                }
+                bulkTracks = null
+                selectedTracks = emptyList()
+            },
+            onPlayNext = {
+                onPlayNextItems(selected)
+                bulkTracks = null
+                selectedTracks = emptyList()
+            },
+            onAddToNowPlaying = {
+                onAddToNowPlaying(selected)
+                bulkTracks = null
+                selectedTracks = emptyList()
+            },
+            onAddToPlaylist = {
+                playlistTracks = selected
+                bulkTracks = null
+            }
+        )
     }
+
+    infoTrack?.let { SongInfoDialog(it) { infoTrack = null } }
 
     if (database != null) {
         playlistTrack?.let {
-            PlaylistPickerDialog(
-                database = database,
-                tracks = listOf(it),
-                onDismiss = { playlistTrack = null }
-            )
+            PlaylistPickerDialog(database = database, tracks = listOf(it), onDismiss = { playlistTrack = null })
         }
-    }
-
-    if (database != null) {
         playlistTracks?.let { selected ->
             PlaylistPickerDialog(
                 database = database,
                 tracks = selected,
-                onDismiss = { playlistTracks = null }
+                onDismiss = {
+                    playlistTracks = null
+                    selectedTracks = emptyList()
+                }
             )
         }
     }
@@ -1955,9 +2299,13 @@ private fun SongList(
 private fun TrackRow(
     track: MusicTrack,
     onClick: () -> Unit,
-    onLongClick: () -> Unit = {}
+    onLongClick: () -> Unit = {},
+    selected: Boolean = false
 ) {
-    Row(
+    Surface(
+        color = if (selected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surface,
+        modifier = Modifier.fillMaxWidth()
+    ) { Row(
         Modifier
             .fillMaxWidth()
             .pointerInput(track.resourceUrl) {
@@ -1976,7 +2324,14 @@ private fun TrackRow(
                 style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         Text(formatDuration(track.duration), style = MaterialTheme.typography.labelSmall)
-    }
+        if (selected) {
+            Checkbox(
+                checked = true,
+                onCheckedChange = null,
+                modifier = Modifier.padding(start = 6.dp)
+            )
+        }
+    } }
 }
 
 @Composable
@@ -1991,8 +2346,8 @@ private fun AlbumDetail(
 ) {
     BackHandler(onBack = onBack)
 
-    Column(Modifier.fillMaxSize()) {
-        TextButton(onClick = onBack, modifier = Modifier.height(32.dp),
+    Column(Modifier.fillMaxSize().padding(top = 20.dp)) {
+        TextButton(onClick = onBack, modifier = Modifier.height(36.dp),
             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp)) {
             Text("‹ Albums")
         }
@@ -2052,6 +2407,7 @@ private fun ItemActionDialog(
     onDismiss: () -> Unit,
     onPlayNow: (() -> Unit)? = null,
     onSelectAll: (() -> Unit)? = null,
+    onMultiSelect: (() -> Unit)? = null,
     onPlayNext: () -> Unit,
     onAddToNowPlaying: () -> Unit,
     onAddToPlaylist: () -> Unit,
@@ -2068,6 +2424,9 @@ private fun ItemActionDialog(
                 if (onSelectAll != null) {
                     TextButton(onClick = onSelectAll, modifier = Modifier.fillMaxWidth()) { Text("Select All") }
                 }
+                if (onMultiSelect != null) {
+                    TextButton(onClick = onMultiSelect, modifier = Modifier.fillMaxWidth()) { Text("Multi-select") }
+                }
                 TextButton(onClick = onPlayNext, modifier = Modifier.fillMaxWidth()) { Text("Play Next") }
                 TextButton(onClick = onAddToNowPlaying, modifier = Modifier.fillMaxWidth()) { Text("Add to Now Playing") }
                 TextButton(onClick = onAddToPlaylist, modifier = Modifier.fillMaxWidth()) { Text("Add to Playlist") }
@@ -2080,23 +2439,33 @@ private fun ItemActionDialog(
 
 @Composable
 private fun SongInfoDialog(track: MusicTrack, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val clipboard = remember { context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager }
+    val rows = listOf(
+        "Title" to track.title, "Artist" to track.artist, "Release" to track.album,
+        "Genre" to track.genre, "Year" to track.year, "Track" to (track.trackNumber?.toString() ?: ""),
+        "Duration" to formatDuration(track.duration), "Format" to track.mimeType, "Server" to track.serverName,
+        "DLNA ID" to track.dlnaId, "Source" to track.resourceUrl
+    )
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Song Info") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                InfoLine("Title", track.title)
-                InfoLine("Artist", track.artist)
-                InfoLine("Release", track.album)
-                InfoLine("Genre", track.genre)
-                InfoLine("Year", track.year)
-                InfoLine("Track", track.trackNumber?.toString() ?: "")
-                InfoLine("Duration", formatDuration(track.duration))
-                InfoLine("Format", track.mimeType)
-                InfoLine("Server", track.serverName)
-                InfoLine("DLNA ID", track.dlnaId)
-                InfoLine("Source", track.resourceUrl)
+                Text("Tap a value to copy it.", style = MaterialTheme.typography.labelSmall)
+                rows.filter { it.second.isNotBlank() }.forEach { (label, value) ->
+                    Column(Modifier.fillMaxWidth().clickable { clipboard.setPrimaryClip(ClipData.newPlainText(label, value)) }.padding(vertical = 2.dp)) {
+                        Text(label, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                        Text(value, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
             }
+        },
+        dismissButton = {
+            TextButton(onClick = {
+                val text = rows.filter { it.second.isNotBlank() }.joinToString("\n") { "${it.first}: ${it.second}" }
+                clipboard.setPrimaryClip(ClipData.newPlainText("Song Info", text))
+            }) { Text("Copy All") }
         },
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } }
     )
@@ -2227,14 +2596,25 @@ private fun PlaylistList(playlists: List<MusicPlaylist>, onSelect: (MusicPlaylis
 private fun PlaylistDetail(playlist: MusicPlaylist, tracks: List<MusicTrack>, database: MusicDatabase, onBack: () -> Unit,
     onPlayQueue: (List<MusicTrack>, MusicTrack) -> Unit, onPlayNextItems: (List<MusicTrack>) -> Unit, onAddToNowPlaying: (List<MusicTrack>) -> Unit) {
     BackHandler(onBack = onBack)
+    var sortMenuOpen by remember { mutableStateOf(false) }
+    var sortField by remember { mutableStateOf(TrackSort.ORDER) }
+    var ascending by remember { mutableStateOf(true) }
+    val displayedTracks = remember(tracks, sortField, ascending) { sortedTracks(tracks, sortField, ascending) }
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
             TextButton(onClick = onBack) { Text("‹ Back") }
             Column(Modifier.weight(1f)) { Text(playlist.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold); Text("${tracks.size} tracks", style = MaterialTheme.typography.labelSmall) }
-            Button(onClick = { tracks.firstOrNull()?.let { onPlayQueue(tracks, it) } }, enabled = tracks.isNotEmpty()) { Text("Play") }
+            Box {
+                TextButton(onClick = { sortMenuOpen = true }) { Text("Sort") }
+                DropdownMenu(expanded = sortMenuOpen, onDismissRequest = { sortMenuOpen = false }) {
+                    TrackSort.entries.forEach { option -> DropdownMenuItem(text = { Text(option.label) }, onClick = { sortField = option; sortMenuOpen = false; if (option == TrackSort.ORDER) ascending = true }) }
+                    if (sortField != TrackSort.ORDER) DropdownMenuItem(text = { Text(if (ascending) "Descending" else "Ascending") }, onClick = { ascending = !ascending; sortMenuOpen = false })
+                }
+            }
+            Button(onClick = { displayedTracks.firstOrNull()?.let { onPlayQueue(displayedTracks, it) } }, enabled = displayedTracks.isNotEmpty()) { Text("Play") }
         }
         HorizontalDivider()
-        SongList(tracks = tracks, database = database, onPlayTrack = { onPlayQueue(tracks, it) }, onPlayNextItems = onPlayNextItems, onAddToNowPlaying = onAddToNowPlaying)
+        SongList(tracks = displayedTracks, database = database, onPlayTrack = { onPlayQueue(displayedTracks, it) }, onPlayQueue = onPlayQueue, onPlayNextItems = onPlayNextItems, onAddToNowPlaying = onAddToNowPlaying)
     }
 }
 
