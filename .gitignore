@@ -1,28 +1,18 @@
-# Gradle
-.gradle/
-build/
-**/build/
-
-# Android Studio
-.idea/
 *.iml
-
-# Local machine configuration
+.gradle/
 local.properties
 **/local.properties
-
-# Signing / credentials
-*.jks
-*.keystore
-.env
-.env.*
-
-# Native build
+.idea/workspace.xml
+.idea/deploymentTargetSelector.xml
+.idea/caches/
+.idea/libraries/
+build/
+**/build/
+captures/
 .externalNativeBuild/
 .cxx/
-
-# OS / editor
 .DS_Store
-Thumbs.db
-*.swp
-*~
+
+# Android Studio / IntelliJ local state
+.idea/
+**/.idea/
