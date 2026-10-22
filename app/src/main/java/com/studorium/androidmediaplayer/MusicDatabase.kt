@@ -19,7 +19,9 @@ data class MusicTrack(
     val albumArtUrl: String,
     val resourceUrl: String,
     val mimeType: String,
-    val serverName: String
+    val serverName: String,
+    val albumArtist: String = "",
+    val discNumber: Int? = null
 )
 
 data class MusicAlbum(
@@ -28,7 +30,8 @@ data class MusicAlbum(
     val year: String,
     val genre: String,
     val albumArtUrl: String,
-    val trackCount: Int
+    val trackCount: Int,
+    val serverName: String = ""
 )
 
 data class MusicArtist(
@@ -41,7 +44,8 @@ data class MusicArtist(
 data class MusicPlaylist(
     val id: Long,
     val name: String,
-    val trackCount: Int
+    val trackCount: Int,
+    val serverName: String = ""
 )
 
 class MusicDatabase(context: Context) : SQLiteOpenHelper(
@@ -67,13 +71,16 @@ class MusicDatabase(context: Context) : SQLiteOpenHelper(
                 album_art_url TEXT NOT NULL DEFAULT '',
                 resource_url TEXT NOT NULL,
                 mime_type TEXT NOT NULL DEFAULT '',
-                server_name TEXT NOT NULL DEFAULT ''
+                server_name TEXT NOT NULL DEFAULT '',
+                album_artist TEXT NOT NULL DEFAULT '',
+                disc_number INTEGER
             )""".trimIndent()
         )
         database.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_tracks_resource_url ON tracks(resource_url)")
         database.execSQL("CREATE INDEX IF NOT EXISTS index_tracks_album ON tracks(album)")
         database.execSQL("CREATE INDEX IF NOT EXISTS index_tracks_artist ON tracks(artist)")
         database.execSQL("CREATE INDEX IF NOT EXISTS index_tracks_genre ON tracks(genre)")
+        database.execSQL("CREATE INDEX IF NOT EXISTS index_tracks_server_album ON tracks(server_name, album, year)")
     }
 
     private fun createPlaylists(database: SQLiteDatabase) {
@@ -103,6 +110,11 @@ class MusicDatabase(context: Context) : SQLiteOpenHelper(
 
     override fun onUpgrade(database: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         if (oldVersion < 2) createPlaylists(database)
+        if (oldVersion < 3) {
+            database.execSQL("ALTER TABLE tracks ADD COLUMN album_artist TEXT NOT NULL DEFAULT ''")
+            database.execSQL("ALTER TABLE tracks ADD COLUMN disc_number INTEGER")
+            database.execSQL("CREATE INDEX IF NOT EXISTS index_tracks_server_album ON tracks(server_name, album, year)")
+        }
     }
 
     fun clearTracks() { writableDatabase.delete("tracks", null, null) }
@@ -115,6 +127,8 @@ class MusicDatabase(context: Context) : SQLiteOpenHelper(
             if (track.trackNumber != null) put("track_number", track.trackNumber) else putNull("track_number")
             put("year", track.year); put("duration", track.duration); put("album_art_url", track.albumArtUrl)
             put("resource_url", track.resourceUrl); put("mime_type", track.mimeType); put("server_name", track.serverName)
+            put("album_artist", track.albumArtist)
+            if (track.discNumber != null) put("disc_number", track.discNumber) else putNull("disc_number")
         }
         val db = writableDatabase
         val updated = db.update("tracks", values, "resource_url = ?", arrayOf(track.resourceUrl))
@@ -129,7 +143,7 @@ class MusicDatabase(context: Context) : SQLiteOpenHelper(
         readableDatabase.rawQuery("SELECT COUNT(*) FROM tracks", null).use { if (it.moveToFirst()) it.getInt(0) else 0 }
 
     fun getAllTracks(): List<MusicTrack> = queryTracks(
-        """SELECT id,dlna_id,title,artist,album,genre,track_number,year,duration,album_art_url,resource_url,mime_type,server_name
+        """SELECT id,dlna_id,title,artist,album,genre,track_number,year,duration,album_art_url,resource_url,mime_type,server_name,album_artist,disc_number
            FROM tracks ORDER BY artist COLLATE NOCASE, album COLLATE NOCASE,
            CASE WHEN track_number IS NULL THEN 1 ELSE 0 END, track_number, title COLLATE NOCASE""",
         emptyArray()
@@ -138,16 +152,34 @@ class MusicDatabase(context: Context) : SQLiteOpenHelper(
     fun getAlbums(): List<MusicAlbum> {
         val result = mutableListOf<MusicAlbum>()
         readableDatabase.rawQuery(
-            """SELECT CASE WHEN TRIM(album)='' THEN 'Unknown Release' ELSE album END,
-                      CASE WHEN TRIM(artist)='' THEN 'Unknown Artist' ELSE artist END,
-                      MAX(year), MAX(genre),
+            """WITH album_stats AS (
+                   SELECT server_name, LOWER(TRIM(album)) AS album_key, year,
+                          COUNT(DISTINCT CASE WHEN TRIM(artist)!='' THEN LOWER(TRIM(artist)) END) AS artist_count
+                   FROM tracks GROUP BY server_name, LOWER(TRIM(album)), year
+               ), normalized AS (
+                   SELECT t.*,
+                     CASE WHEN TRIM(t.album_artist) != '' THEN LOWER(TRIM(t.album_artist))
+                          WHEN COALESCE(s.artist_count, 0) > 1 THEN 'various artists'
+                          ELSE LOWER(TRIM(t.artist)) END AS album_artist_key,
+                     CASE WHEN TRIM(t.album_artist) != '' THEN t.album_artist
+                          WHEN COALESCE(s.artist_count, 0) > 1 THEN 'Various Artists'
+                          WHEN TRIM(t.artist) = '' THEN 'Unknown Artist'
+                          ELSE t.artist END AS display_artist
+                   FROM tracks t LEFT JOIN album_stats s
+                     ON s.server_name=t.server_name AND s.album_key=LOWER(TRIM(t.album)) AND s.year=t.year
+               )
+               SELECT CASE WHEN TRIM(album)='' THEN 'Unknown Release' ELSE album END,
+                      display_artist, COALESCE(year,''), MAX(genre),
                       MAX(CASE WHEN TRIM(album_art_url)!='' THEN album_art_url ELSE '' END),
-                      COUNT(*)
-               FROM tracks GROUP BY LOWER(TRIM(album)), LOWER(TRIM(artist))
+                      COUNT(*), server_name
+               FROM normalized
+               GROUP BY server_name, LOWER(TRIM(album)), COALESCE(year,''), album_artist_key
                ORDER BY 1 COLLATE NOCASE, 2 COLLATE NOCASE""", null
         ).use { c ->
-            while (c.moveToNext()) result += MusicAlbum(c.getString(0), c.getString(1), c.getString(2) ?: "",
-                c.getString(3) ?: "", c.getString(4) ?: "", c.getInt(5))
+            while (c.moveToNext()) result += MusicAlbum(
+                c.getString(0), c.getString(1), c.getString(2) ?: "", c.getString(3) ?: "",
+                c.getString(4) ?: "", c.getInt(5), c.getString(6) ?: ""
+            )
         }
         return result
     }
@@ -166,18 +198,23 @@ class MusicDatabase(context: Context) : SQLiteOpenHelper(
     }
 
     fun getTracksForAlbum(album: MusicAlbum): List<MusicTrack> {
-        val a = if (album.title == "Unknown Release") "" else album.title
-        val ar = if (album.artist == "Unknown Artist") "" else album.artist
+        val title = if (album.title == "Unknown Release") "" else album.title
+        val server = album.serverName
+        val year = album.year
+        val various = album.artist.equals("Various Artists", ignoreCase = true)
+        val whereArtist = if (various) "" else "AND (CASE WHEN TRIM(album_artist)!='' THEN LOWER(TRIM(album_artist)) ELSE LOWER(TRIM(artist)) END)=LOWER(TRIM(?))"
+        val args = if (various) arrayOf(title, server, year) else arrayOf(title, server, year, album.artist.let { if (it == "Unknown Artist") "" else it })
         return queryTracks(
-            """SELECT id,dlna_id,title,artist,album,genre,track_number,year,duration,album_art_url,resource_url,mime_type,server_name
-               FROM tracks WHERE LOWER(TRIM(album))=LOWER(TRIM(?)) AND LOWER(TRIM(artist))=LOWER(TRIM(?))
-               ORDER BY CASE WHEN track_number IS NULL THEN 1 ELSE 0 END, track_number, title COLLATE NOCASE""",
-            arrayOf(a, ar)
+            """SELECT id,dlna_id,title,artist,album,genre,track_number,year,duration,album_art_url,resource_url,mime_type,server_name,album_artist,disc_number
+               FROM tracks WHERE LOWER(TRIM(album))=LOWER(TRIM(?)) AND server_name=? AND COALESCE(year,'')=COALESCE(?,'') $whereArtist
+               ORDER BY CASE WHEN disc_number IS NULL THEN 1 ELSE 0 END, disc_number,
+                 CASE WHEN track_number IS NULL THEN 1 ELSE 0 END, track_number, title COLLATE NOCASE""",
+            args
         )
     }
 
     fun getRandomTracks(count: Int = 100): List<MusicTrack> = queryTracks(
-        """SELECT id,dlna_id,title,artist,album,genre,track_number,year,duration,album_art_url,resource_url,mime_type,server_name
+        """SELECT id,dlna_id,title,artist,album,genre,track_number,year,duration,album_art_url,resource_url,mime_type,server_name,album_artist,disc_number
            FROM tracks ORDER BY RANDOM() LIMIT ?""", arrayOf(count.toString())
     )
 
@@ -233,7 +270,7 @@ class MusicDatabase(context: Context) : SQLiteOpenHelper(
 
     fun getPlaylistTracks(playlistId: Long): List<MusicTrack> = queryTracks(
         """SELECT t.id,t.dlna_id,t.title,t.artist,t.album,t.genre,t.track_number,t.year,t.duration,
-                  t.album_art_url,t.resource_url,t.mime_type,t.server_name
+                  t.album_art_url,t.resource_url,t.mime_type,t.server_name,t.album_artist,t.disc_number
            FROM playlist_tracks pt
            JOIN tracks t ON t.resource_url = pt.resource_url
            WHERE pt.playlist_id = ?
@@ -250,11 +287,12 @@ class MusicDatabase(context: Context) : SQLiteOpenHelper(
     private fun Cursor.toMusicTrack() = MusicTrack(
         getLong(0), getString(1), getString(2), getString(3), getString(4), getString(5),
         if (isNull(6)) null else getInt(6), getString(7), getString(8), getString(9),
-        getString(10), getString(11), getString(12)
+        getString(10), getString(11), getString(12), getString(13) ?: "",
+        if (isNull(14)) null else getInt(14)
     )
 
     companion object {
         private const val DATABASE_NAME = "music_library.db"
-        private const val DATABASE_VERSION = 2
+        private const val DATABASE_VERSION = 3
     }
 }

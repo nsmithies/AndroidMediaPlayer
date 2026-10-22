@@ -83,7 +83,9 @@ class MusicLibraryScanner(
                         albumArtUrl = item.albumArtUrl,
                         resourceUrl = item.resourceUrl,
                         mimeType = item.mimeType,
-                        serverName = server.friendlyName
+                        serverName = server.friendlyName,
+                        albumArtist = item.albumArtist,
+                        discNumber = item.discNumber
                     )
                 )
 

@@ -368,6 +368,7 @@ class MainActivity : ComponentActivity() {
                 var showDisconnectedDialog by remember { mutableStateOf(false) }
                 var discovery by remember { mutableStateOf<DlnaDiscoveryResult?>(null) }
                 var searchingServers by remember { mutableStateOf(false) }
+                var showServerChooser by remember { mutableStateOf(false) }
                 var restoring by remember { mutableStateOf(true) }
                 var scanning by remember { mutableStateOf(false) }
                 var progress by remember { mutableStateOf<MusicScanProgress?>(null) }
@@ -488,10 +489,11 @@ class MainActivity : ComponentActivity() {
                 Surface(Modifier.fillMaxSize()) {
                     when {
                         restoring -> CenterLoading("Opening your music library...")
-                        server == null -> ServerChooser(
+                        showServerChooser || server == null -> ServerChooser(
                             result = discovery,
                             searching = searchingServers,
                             error = error,
+                            onCancel = if (server != null) ({ showServerChooser = false }) else null,
                             onSearch = {
                                 scope.launch {
                                     searchingServers = true
@@ -502,10 +504,24 @@ class MainActivity : ComponentActivity() {
                                 }
                             },
                             onSelect = {
-                                store.saveServer(it)
-                                server = it
-                                serverConnected = true
-                                discovery = null
+                                scope.launch {
+                                    reconnecting = true
+                                    status = "Connecting to ${it.friendlyName}…"
+                                    val connected = serverResponds(it)
+                                    if (connected) {
+                                        store.saveServer(it)
+                                        server = it
+                                        serverConnected = true
+                                        showServerChooser = false
+                                        showDisconnectedDialog = false
+                                        status = "Connected to ${it.friendlyName}"
+                                        error = null
+                                        discovery = null
+                                    } else {
+                                        error = "${it.friendlyName} was found but did not respond. Try another server."
+                                    }
+                                    reconnecting = false
+                                }
                             }
                         )
                         else -> LibraryHome(
@@ -562,11 +578,23 @@ class MainActivity : ComponentActivity() {
                                 else showDisconnectedDialog = true
                             },
                             onReconnectServer = { reconnect(true) },
+                            onFindServers = {
+                                showServerChooser = true
+                                scope.launch {
+                                    searchingServers = true
+                                    error = null
+                                    discovery = null
+                                    try { discovery = DlnaDiscovery(context).discover() }
+                                    catch (e: Exception) { error = e.message ?: e.javaClass.simpleName }
+                                    finally { searchingServers = false }
+                                }
+                            },
                             onChangeServer = {
                                 store.clearServer()
                                 server = null
                                 serverConnected = false
                                 selectedAlbum = null
+                                showServerChooser = true
                             }
                         )
                     }
@@ -653,6 +681,7 @@ private fun LibraryHome(
     onBackAlbum: () -> Unit,
     onRefresh: () -> Unit,
     onReconnectServer: () -> Unit,
+    onFindServers: () -> Unit,
     onChangeServer: () -> Unit
 ) {
     var tab by remember { mutableStateOf(LibraryTab.ALBUMS) }
@@ -886,6 +915,10 @@ private fun LibraryHome(
                     onReconnectServer()
                     toolsOpen = false
                 },
+                onFindServers = {
+                    onFindServers()
+                    toolsOpen = false
+                },
                 onRefresh = {
                     onRefresh()
                     toolsOpen = false
@@ -1054,6 +1087,7 @@ private fun ToolsModal(
     onArtworkSettings: () -> Unit,
     onAbout: () -> Unit,
     onReconnect: () -> Unit,
+    onFindServers: () -> Unit,
     onRefresh: () -> Unit,
     onChangeServer: () -> Unit,
     onClose: () -> Unit
@@ -1102,6 +1136,7 @@ private fun ToolsModal(
                     onReconnect,
                     enabled = !reconnecting && !serverConnected
                 )
+                SideAction("Find Servers", "Search the network and reconnect to a discovered music server", onFindServers)
                 SideAction(
                     if (scanning) "Scanning…" else "Refresh Library",
                     "Update the local music catalogue",
@@ -2640,11 +2675,15 @@ private fun AboutOverlay(songCount: Int, albumCount: Int, artistCount: Int, onCl
 
 @Composable
 private fun ServerChooser(result: DlnaDiscoveryResult?, searching: Boolean, error: String?,
-                          onSearch: () -> Unit, onSelect: (DlnaServer) -> Unit) {
+                          onSearch: () -> Unit, onSelect: (DlnaServer) -> Unit,
+                          onCancel: (() -> Unit)? = null) {
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Text("Choose Music Server", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-        Button(onClick = onSearch, enabled = !searching, modifier = Modifier.padding(vertical = 14.dp)) {
-            Text(if (searching) "Searching…" else "Find Music Servers")
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Button(onClick = onSearch, enabled = !searching, modifier = Modifier.padding(vertical = 14.dp)) {
+                Text(if (searching) "Searching…" else "Find Music Servers")
+            }
+            if (onCancel != null) TextButton(onClick = onCancel) { Text("Back to Library") }
         }
         if (searching) CircularProgressIndicator()
         if (error != null) Text(error)

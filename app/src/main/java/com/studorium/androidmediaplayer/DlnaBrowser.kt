@@ -25,6 +25,8 @@ data class DlnaMediaObject(
     val genre: String,
     val trackNumber: Int?,
     val date: String,
+    val albumArtist: String = "",
+    val discNumber: Int? = null,
     val year: String,
 
     // Artwork
@@ -800,6 +802,14 @@ class DlnaBrowser {
             )
                 .toIntOrNull()
 
+        val albumArtist = firstNonBlank(childText(element, "albumArtist"), childText(element, "albumartist"))
+
+        val discNumber = firstNonBlank(
+            childText(element, "originalDiscNumber"),
+            childText(element, "discNumber"),
+            childText(element, "disc")
+        ).toIntOrNull()
+
         val date =
             childText(
                 element,
@@ -904,6 +914,9 @@ class DlnaBrowser {
 
             date =
                 date,
+
+            albumArtist = albumArtist,
+            discNumber = discNumber,
 
             year =
                 year,
